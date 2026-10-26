@@ -11,9 +11,12 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { createHash, createHmac, randomUUID } from 'node:crypto';
 import YAML from 'js-yaml';
 import { AbstractApiClient } from '@deepseek-ai/dsh-host-apiproxy/client';
+const execFileAsync = promisify(execFile);
 
 /** DSH home：凭据文件与（历史）启动日志都在这里。 */
 export function resolveDshHome() {
@@ -161,6 +164,66 @@ export function isLoopbackBase(baseUrl) {
   } catch {
     return false;
   }
+}
+
+/**
+ * Discover the currently listening DSH web port. DSH may allocate a new port
+ * after every restart, so the configured URL is only a starting hint.
+ * Candidates are limited to loopback listeners and are verified with the DSH
+ * settings RPC before being returned.
+ */
+export async function discoverDshBaseUrl(currentBaseUrl = '', { timeoutMs = 1200, listeners, secret = readBrowserSessionSecret(), token = '' } = {}) {
+  const candidates = [];
+  const add = (port) => {
+    const n = Number(port);
+    if (Number.isInteger(n) && n > 0 && n < 65536 && !candidates.includes(n)) candidates.push(n);
+  };
+  try { add(new URL(String(currentBaseUrl)).port); } catch {}
+  add(3080);
+  // Probe the current endpoint first to avoid touching other services while healthy.
+  const probe = async (base) => {
+    const headers = {};
+    if (secret) { try { headers.cookie = mintBrowserSessionCookie(base, secret); } catch {} }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      if (!headers.cookie && token) {
+        const url = new URL('/', base);
+        url.searchParams.set('token', token);
+        const exchange = await fetch(url, { redirect: 'manual', signal: controller.signal });
+        const cookie = exchange.headers.get('set-cookie');
+        await exchange.body?.cancel();
+        if (cookie) headers.cookie = cookie.split(';')[0];
+      }
+      const rpcId = randomUUID();
+      const res = await fetch(`${base}/api/settings/describe`, {
+        method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'client-request', rpcId, method: 'settings/describe', payload: { args: {} } }),
+        signal: controller.signal, redirect: 'error'
+      });
+      const body = await res.json().catch(() => null);
+      return res.ok && body?.type === 'server-response' && body.rpcId === rpcId && body.result?.ok === true ? base : '';
+    } catch { return ''; }
+    finally { clearTimeout(timer); }
+  };
+  if (isLoopbackBase(currentBaseUrl) && await probe(String(currentBaseUrl).replace(/\/+$/, ''))) return String(currentBaseUrl).replace(/\/+$/, '');
+  try {
+    const options = { encoding: 'utf8', timeout: 3000, windowsHide: true };
+    const out = listeners ?? (process.platform === 'win32'
+      ? (await execFileAsync('netstat', ['-ano', '-p', 'TCP'], options)).stdout
+      : (await execFileAsync('sh', ['-c', 'ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null || true'], options)).stdout);
+    for (const line of String(out).split(/\r?\n/)) {
+      // Only loopback listeners; never probe LAN/WAN services.
+      if (!/LISTEN/i.test(line)) continue;
+      const m = line.match(/(?:127\.0\.0\.1|0\.0\.0\.0|\[?::1\]?|\[::\]|\*|localhost)[:.]([0-9]{1,5})(?:\s|$)/i);
+      if (m) add(m[1]);
+    }
+  } catch {}
+  for (let i = 0; i < candidates.length; i += 8) {
+    const found = (await Promise.all(candidates.slice(i, i + 8).map((port) => probe(`http://127.0.0.1:${port}`)))).find(Boolean);
+    if (found) return found;
+  }
+  return '';
 }
 
 /** 新协议 RPC 的 args 包装：旧 payload -> { <参数名>: payload }。 */
@@ -319,6 +382,16 @@ export class NodeApiClient extends AbstractApiClient {
     // 期望 follow 的会话集合：**跨重连保留**。DSH 重启或 WS 中断后必须重放，
     // 否则已有会话再也收不到 session 事件（turn/end 丢失 → QQ 上永远没有回复，且无报错）。
     this._desiredFollows = new Set();
+  }
+
+  /** Switch the endpoint used by subsequent HTTP and WebSocket connections. */
+  setBaseUrl(baseUrl) {
+    const next = String(baseUrl ?? '').replace(/\/+$/, '');
+    if (!next || next === this.baseUrl) return false;
+    this.baseUrl = next;
+    this.invalidateAuth();
+    this._closeMux?.();
+    return true;
   }
 
   /** Node 没有 location；把 base 固定为配置的 DSH 地址（回环地址天然通过 /api 信任栅栏）。 */
@@ -893,6 +966,7 @@ export class NodeApiClient extends AbstractApiClient {
       endStream();
       if (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN) socket.close();
     };
+    this._closeMux = handleAbort;
     socket.addEventListener('open', handleOpen);
     socket.addEventListener('message', handleMessage);
     socket.addEventListener('close', handleClose, { once: true });
@@ -909,6 +983,7 @@ export class NodeApiClient extends AbstractApiClient {
         await new Promise((resolve) => { wake = resolve; });
       }
     } finally {
+      if (this._closeMux === handleAbort) this._closeMux = null;
       if (this._muxSendOpen === sendOpen) this._muxSendOpen = null;
       sig.removeEventListener('abort', handleAbort);
       socket.removeEventListener('open', handleOpen);

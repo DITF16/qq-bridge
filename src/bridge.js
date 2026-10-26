@@ -16,7 +16,7 @@ import { extractPresetPrefix, presetPromptBlockers, presetPromptWarnings, render
 import { GEN1_ROLE_LINE_RE, parseRoleSections, roleCharStats, roleSectionReport, selectRoleText } from './role-card.js';
 import { fileURLToPath } from 'node:url';
 import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
-import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } from './dsh-client.js';
+import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken, discoverDshBaseUrl } from './dsh-client.js';
 import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-plain.js';
 import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
@@ -2890,6 +2890,13 @@ async function main() {
   const checkDsh = async () => {
     let ok = false;
     try {
+      const discovered = await discoverDshBaseUrl(api.baseUrl, { token: api.launchToken });
+      if (discovered && discovered !== api.baseUrl) {
+        const previous = api.baseUrl;
+        api.setBaseUrl(discovered);
+        cfg.dsh.baseUrl = discovered;
+        log(`DSH 端口已热切换：${previous} → ${discovered}`);
+      }
       await api.settings.describe({});
       ok = true;
     } catch {}
