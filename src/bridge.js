@@ -8085,10 +8085,28 @@ async function main() {
     const provider = String(cfg.dsh?.provider || 'deepseek-official');
     const model = String(cfg.dsh?.model || 'deepseek-flash');
     const effort = String(cfg.dsh?.reasoningEffort || REASONING_EFFORT_DEFAULT);
+    // 自定义 provider（例如 my-api）可能只注册了模型 ID，没有声明 DSH
+    // reasoning 能力。此时发送 reasoningEffort 会被 DSH 拒绝为
+    // session/model-unavailable；只在目录明确声明并包含该档位时才传入。
+    let selectedReasoningEffort = effort;
+    try {
+      const catalog = unwrap(await fetchModelCatalog(), 'session.modelCatalog');
+      const entry = (catalog?.groups ?? [])
+        .find((group) => group?.id === provider)?.models?.find((item) => item?.id === model);
+      const advertised = entry?.reasoning?.efforts;
+      if (!Array.isArray(advertised) || !advertised.some((item) => String(item?.id ?? '') === effort)) {
+        selectedReasoningEffort = undefined;
+        log(`模型 ${provider}/${model} 未声明推理档位，省略 reasoningEffort 参数`);
+      }
+    } catch {
+      // 目录不可用时保留原有行为，由 DSH 返回明确的模型选择错误。
+    }
     let lastError = null;
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       try {
-        const result = unwrap(await api.sessions.selectModel({ sessionId, provider, model, reasoningEffort: effort }), 'session.selectModel');
+        const selection = { sessionId, provider, model };
+        if (selectedReasoningEffort !== undefined) selection.reasoningEffort = selectedReasoningEffort;
+        const result = unwrap(await api.sessions.selectModel(selection), 'session.selectModel');
         modelAppliedSessions.set(sessionId, modelSelectionEpoch);
         log(`已设置会话模型 ${sessionId} -> ${result.selected.provider}/${result.selected.model} (${result.selected.reasoningEffort ?? '默认'})`);
         return 'applied';
